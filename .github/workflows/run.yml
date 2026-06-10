@@ -26,7 +26,7 @@ jobs:
         # 每个 instance = 一个独立 runner(独立 IP), 内部再用 TABS 个标签页并行
         instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     env:
-      MODE: d            # d=桌面 m=手机
+      MODE: m            # d=桌面 m=手机
       NUM_TYPE: big      # big / mysql
       TABS: "5"          # 每个 runner 内并行标签页数
       RUN_SECONDS: "300" # 跑 5 分钟后优雅退出
