@@ -262,17 +262,20 @@ class USPSAddon:
                 if cnt <= MAX_REFRESH:
                     self.retry_counts[key] = cnt
                     logger.info(f"🔄 解析为空(len={len(body)}), 第 {cnt}/{MAX_REFRESH} 次刷新重试当前批")
-                    flow.response.text = (
+                    refresh_html = (
                         f'<!doctype html><html><head>'
-                        f'<meta http-equiv="refresh" content="0;url={url}">'
+                        f'<meta http-equiv="refresh" content="1;url={url}">'
                         f'</head><body>retry</body></html>'
                     )
+                    # 用 make(200) 整体替换: 原响应可能非 200(空/中断), 否则浏览器不会执行刷新
+                    flow.response = http.Response.make(
+                        200, refresh_html.encode(), {"Content-Type": "text/html; charset=utf-8"})
                 else:
                     self.retry_counts.pop(key, None)
                     self.total_empty += 1   # 刷满上限仍没数据, 才算一次真失败
                     logger.info(f"⚠️ 刷新 {MAX_REFRESH} 次仍为空, 放弃该批, 取下一批")
-                    flow.response.text = _REDIRECT_TO_NEXT
-                flow.response.headers["content-type"] = "text/html; charset=utf-8"
+                    flow.response = http.Response.make(
+                        200, _REDIRECT_TO_NEXT.encode(), {"Content-Type": "text/html; charset=utf-8"})
                 return
 
             # 其它 HTML(挑战相关页 / iframe)也注入指纹伪装
@@ -417,7 +420,7 @@ async def _main():
 
     deadline = (time.monotonic() + RUN_SECONDS) if RUN_SECONDS > 0 else None
     # 用"实际流量活性"判断 Chrome 是否还在干活(launcher 进程退出≠浏览器关闭, 不能用 proc.poll)
-    STALL_RESTART = 90          # 连续多少秒没有任何流量就重启 Chrome
+    STALL_RESTART = 60          # 连续多少秒没有任何流量就重启 Chrome
     last_total = -1
     last_active = time.monotonic()
     start_ts = time.monotonic()
