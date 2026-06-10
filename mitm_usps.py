@@ -98,6 +98,11 @@ SUCCESS_MIN_SAMPLES = _env_int('SUCCESS_MIN_SAMPLES', 20)     # 至少累计这�
 STEALTH = _env_bool('STEALTH', True)         # 通过 mitmproxy 注入指纹伪装脚本 + 放宽 CSP
 MAX_REFRESH = _env_int('MAX_REFRESH', 5)     # 解析为空时, 刷新重试当前批的最大次数
 
+# 统一伪装成 Windows Chrome(消除 Linux/CI 特征): UA flag + client hints + JS navigator 三处一致
+WIN_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+WIN_SECCHUA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+
 # 自驱动用的虚拟调度地址(不真实存在, 由 mitmproxy 拦截并 302 到下一批 USPS URL)
 DISPATCH_HOST = 'usps.local'
 DISPATCH_URL = f'http://{DISPATCH_HOST}/next'
@@ -126,6 +131,9 @@ STEALTH_JS = r"""
     def(navigator,'hardwareConcurrency',8);
     def(navigator,'deviceMemory',8);
     def(navigator,'languages',['en-US','en']);
+    def(navigator,'platform','Win32');
+    def(navigator,'vendor','Google Inc.');
+    try{Object.defineProperty(navigator,'userAgentData',{configurable:true,get:function(){return {brands:[{brand:"Google Chrome",version:"131"},{brand:"Chromium",version:"131"},{brand:"Not_A Brand",version:"24"}],mobile:false,platform:"Windows",getHighEntropyValues:function(){return Promise.resolve({platform:"Windows",platformVersion:"10.0.0",architecture:"x86",bitness:"64",model:"",uaFullVersion:"131.0.0.0",fullVersionList:[{brand:"Google Chrome",version:"131.0.0.0"},{brand:"Chromium",version:"131.0.0.0"}]});}};}});}catch(e){}
     // WebGL 厂商/型号伪装: 把 CI 的 SwiftShader/Mesa 伪装成常见独显
     var patch=function(proto){
       if(!proto||!proto.getParameter)return;
@@ -190,6 +198,15 @@ class USPSAddon:
 
     async def request(self, flow: http.HTTPFlow):
         self.total_requests += 1
+        # 统一 client hints 为 Windows(与 --user-agent 保持一致, 避免 Linux 特征)
+        if STEALTH and MODE == 'd' and 'usps.com' in flow.request.pretty_host:
+            h = flow.request.headers
+            if 'sec-ch-ua' in h:
+                h['sec-ch-ua'] = WIN_SECCHUA
+            if 'sec-ch-ua-platform' in h:
+                h['sec-ch-ua-platform'] = '"Windows"'
+            if 'sec-ch-ua-mobile' in h:
+                h['sec-ch-ua-mobile'] = '?0'
         # 拦截调度地址: 取一批单号, 302 跳到 USPS
         if flow.request.pretty_host == DISPATCH_HOST:
             danhao_ls = await self.scraper.获取单号()
@@ -312,6 +329,8 @@ def start_chrome(user_data_dir: str) -> subprocess.Popen:
         args.append('--headless=new')
     if MODE == 'm':
         args.append('--user-agent=Emb/And/1.0')
+    elif STEALTH:
+        args.append(f'--user-agent={WIN_UA}')
     # 传 N 个调度地址 -> Chrome 开 N 个顶层标签页, 每个独立自驱动循环(共享同一 profile 的 cookie)
     args.extend([DISPATCH_URL] * TABS)
     logger.info(f"启动命令行 Chrome ... ({TABS} 个标签页)")
