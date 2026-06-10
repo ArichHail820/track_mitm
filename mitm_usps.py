@@ -96,6 +96,7 @@ DUMP_TARGET = _env_bool('DUMP_TARGET', False)  # 把目标响应 body 存盘, �
 SUCCESS_THRESHOLD = float(_env('SUCCESS_THRESHOLD', '0.6'))   # 成功率低于此值则优雅结束
 SUCCESS_MIN_SAMPLES = _env_int('SUCCESS_MIN_SAMPLES', 20)     # 至少累计这么多有效样本才判定(避免冷启动误判)
 STEALTH = _env_bool('STEALTH', True)         # 通过 mitmproxy 注入指纹伪装脚本 + 放宽 CSP
+MAX_REFRESH = _env_int('MAX_REFRESH', 5)     # 解析为空时, 刷新重试当前批的最大次数
 
 # 自驱动用的虚拟调度地址(不真实存在, 由 mitmproxy 拦截并 302 到下一批 USPS URL)
 DISPATCH_HOST = 'usps.local'
@@ -185,6 +186,7 @@ class USPSAddon:
         self.dispatched = 0
         self.total_requests = 0      # mitmproxy 收到的所有请求数(判断 Chrome 是否走了代理)
         self._dump_n = 0
+        self.retry_counts = {}       # 首单号 -> 当前批已刷新重试次数
 
     async def request(self, flow: http.HTTPFlow):
         self.total_requests += 1
@@ -234,6 +236,7 @@ class USPSAddon:
 
                 if parsed:
                     self.total_success += 1
+                    self.retry_counts.pop(self.scraper.first_label(url), None)
                     logger.info(
                         f"✅ 解析成功 {len(parsed)} 条 | 首条 {parsed[0]} | "
                         f"累计 ✅{self.total_success}/🛡️{self.total_challenge}/⚠️{self.total_empty}"
@@ -243,17 +246,33 @@ class USPSAddon:
                     flow.response.headers["content-type"] = "text/html; charset=utf-8"
                     return
 
-                # parse 为空: 挑战页/中间页, 让 Chrome 自己跑通; 同时注入指纹伪装
+                # 挑战页/中间页: 让 Chrome 自己跑通挑战, 同时注入指纹伪装
                 if any(m in body for m in
                        ('/_sec/verify', 'bm-verify', 'Object.defineProperty(document',
                         '_sec/cp_challenge', 'ISTL-REDIRECT-TO', "addEventListener('afterReady'")):
                     self.total_challenge += 1
                     logger.info(f"🛡️ 挑战页, 交给 Chrome 自动通过 (len={len(body)})")
+                    if STEALTH and is_html and body:
+                        flow.response.text = _inject_stealth(body)
+                    return
+
+                # 非挑战的空页: USPS 偶发没出数据, 刷新重试当前这批(不取新单号)
+                key = self.scraper.first_label(url)
+                cnt = self.retry_counts.get(key, 0) + 1
+                if cnt <= MAX_REFRESH:
+                    self.retry_counts[key] = cnt
+                    logger.info(f"🔄 解析为空(len={len(body)}), 第 {cnt}/{MAX_REFRESH} 次刷新重试当前批")
+                    flow.response.text = (
+                        f'<!doctype html><html><head>'
+                        f'<meta http-equiv="refresh" content="0;url={url}">'
+                        f'</head><body>retry</body></html>'
+                    )
                 else:
-                    self.total_empty += 1
-                    logger.info(f"⚠️ 目标响应但解析为空 (len={len(body)})")
-                if STEALTH and is_html and body:
-                    flow.response.text = _inject_stealth(body)
+                    self.retry_counts.pop(key, None)
+                    self.total_empty += 1   # 刷满上限仍没数据, 才算一次真失败
+                    logger.info(f"⚠️ 刷新 {MAX_REFRESH} 次仍为空, 放弃该批, 取下一批")
+                    flow.response.text = _REDIRECT_TO_NEXT
+                flow.response.headers["content-type"] = "text/html; charset=utf-8"
                 return
 
             # 其它 HTML(挑战相关页 / iframe)也注入指纹伪装
