@@ -162,6 +162,16 @@ def _inject_stealth(html: str) -> str:
     return tag + html
 
 
+def _safe_text(resp) -> Optional[str]:
+    """安全读取响应文本; 二进制(如 CRX/图片)解码失败时返回 None, 不报错。"""
+    if resp is None:
+        return None
+    try:
+        return resp.text
+    except Exception:
+        return None
+
+
 # ============================== mitmproxy addon ==============================
 
 class USPSAddon:
@@ -207,7 +217,9 @@ class USPSAddon:
                         del flow.response.headers[h]
 
             if self.scraper.is_target_response_url(url):
-                body = flow.response.text or ''
+                body = _safe_text(flow.response)
+                if body is None:
+                    return
                 parsed = self.scraper.parse(body)
 
                 if DUMP_TARGET and not parsed:
@@ -246,7 +258,7 @@ class USPSAddon:
 
             # 其它 HTML(挑战相关页 / iframe)也注入指纹伪装
             if STEALTH and is_html:
-                body = flow.response.text or ''
+                body = _safe_text(flow.response)
                 if body and '<' in body:
                     flow.response.text = _inject_stealth(body)
         except Exception as e:
