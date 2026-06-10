@@ -18,7 +18,7 @@
        如此循环, 无需 CDP 控制浏览器导航。
 
 环境变量:
-    MODE                 'd'(桌面) 或 'm'(手机), 默认 'd'
+    TABS_D / TABS_M      桌面(d)/手机(m)标签页数量, 默认 3 / 2(混合)
     NUM_TYPE             'big' 或 'mysql', 默认 'big'
     MITM_PORT            mitmproxy 监听端口, 默认 8080
     RUN_SECONDS          运行时长(秒), <=0 表示一直跑直到 Ctrl+C, 默认 0
@@ -73,11 +73,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return _env(name, 'true' if default else 'false').lower() in ('1', 'true', 'yes', 'on')
 
 
-MODE = _env('MODE', 'd').lower()
 NUM_TYPE = _env('NUM_TYPE', 'big').lower()
 MITM_PORT = _env_int('MITM_PORT', 8080)
 RUN_SECONDS = _env_int('RUN_SECONDS', 0)
-TABS = max(1, _env_int('TABS', 5))            # 并行标签页数量
+TABS_D = max(0, _env_int('TABS_D', 3))        # 桌面(d)标签页数
+TABS_M = max(0, _env_int('TABS_M', 2))        # 手机(m)标签页数
 HEADLESS = _env_bool('HEADLESS', False)
 def _default_chrome_path() -> str:
     """按平台返回 Chrome 默认路径(可被 CHROME_PATH 环境变量覆盖)。"""
@@ -99,21 +99,26 @@ STEALTH = _env_bool('STEALTH', True)         # 通过 mitmproxy 注入指纹伪�
 MAX_REFRESH = _env_int('MAX_REFRESH', 5)     # 解析为空时, 刷新重试当前批的最大次数
 
 # 自驱动用的虚拟调度地址(不真实存在, 由 mitmproxy 拦截并 302 到下一批 USPS URL)
+# 用 ?m=d / ?m=m 区分该标签页跑桌面还是手机, 循环中保持该模式
 DISPATCH_HOST = 'usps.local'
-DISPATCH_URL = f'http://{DISPATCH_HOST}/next'
 
-# 数据页处理完后, 把响应体替换成这个, 让浏览器立刻跳回调度地址取下一批
-_REDIRECT_TO_NEXT = (
-    f'<!doctype html><html><head>'
-    f'<meta http-equiv="refresh" content="0;url={DISPATCH_URL}">'
-    f'</head><body>next</body></html>'
-)
-# 暂时取不到单号时, 让浏览器 3 秒后重试调度地址
-_RETRY_HTML = (
-    f'<!doctype html><html><head>'
-    f'<meta http-equiv="refresh" content="3;url={DISPATCH_URL}">'
-    f'</head><body>retry</body></html>'
-)
+
+def dispatch_url(mode: str) -> str:
+    return f'http://{DISPATCH_HOST}/next?m={mode}'
+
+
+def _redirect_to_next(mode: str) -> str:
+    # 数据页处理完后, 让浏览器跳回对应模式的调度地址取下一批
+    return (f'<!doctype html><html><head>'
+            f'<meta http-equiv="refresh" content="0;url={dispatch_url(mode)}">'
+            f'</head><body>next</body></html>')
+
+
+def _retry_html(mode: str) -> str:
+    # 暂无单号时 3 秒后重试
+    return (f'<!doctype html><html><head>'
+            f'<meta http-equiv="refresh" content="3;url={dispatch_url(mode)}">'
+            f'</head><body>retry</body></html>')
 
 
 # 指纹伪装脚本: 在每个页面最前面执行, 覆盖 CI/headless 最暴露的特征,
@@ -178,8 +183,10 @@ def _safe_text(resp) -> Optional[str]:
 class USPSAddon:
     """中间人插件: 调度(取单号->跳转) + 解析提交 + 自驱动跳转。"""
 
-    def __init__(self, scraper: UspsScraper):
-        self.scraper = scraper
+    def __init__(self, num_type: str):
+        # 同时持有桌面/手机两个 scraper, 按标签页模式分发
+        self.scraper_d = UspsScraper(mode='d', num_type=num_type)
+        self.scraper_m = UspsScraper(mode='m', num_type=num_type)
         self.total_success = 0
         self.total_challenge = 0
         self.total_empty = 0
@@ -190,18 +197,32 @@ class USPSAddon:
 
     async def request(self, flow: http.HTTPFlow):
         self.total_requests += 1
-        # 拦截调度地址: 取一批单号, 302 跳到 USPS
-        if flow.request.pretty_host == DISPATCH_HOST:
-            danhao_ls = await self.scraper.获取单号()
+        host = flow.request.pretty_host
+        # 手机端必须用 App UA(命令行 UA 是全局的, 故在此按域名单独改, 不影响桌面标签页)
+        if 'm.usps.com' in host:
+            flow.request.headers['user-agent'] = 'Emb/And/1.0'
+        # 调度地址: 按 ?m=d/?m=m 取对应模式的单号并 302 跳转
+        if host == DISPATCH_HOST:
+            mode = 'm' if flow.request.query.get('m', 'd') == 'm' else 'd'
+            scraper = self.scraper_m if mode == 'm' else self.scraper_d
+            danhao_ls = await scraper.获取单号()
             if not danhao_ls:
                 flow.response = http.Response.make(
-                    200, _RETRY_HTML.encode(), {"Content-Type": "text/html; charset=utf-8"}
+                    200, _retry_html(mode).encode(), {"Content-Type": "text/html; charset=utf-8"}
                 )
-                logger.warning("暂无单号, 3s 后重试")
+                logger.warning(f"[{mode}] 暂无单号, 3s 后重试")
                 return
-            url = self.scraper.build_url(danhao_ls)
+            url = scraper.build_url(danhao_ls)
             self.dispatched += 1
             flow.response = http.Response.make(302, b'', {"Location": url})
+
+    def _match(self, url: str):
+        """根据响应 URL 判断属于哪个模式; 返回 (mode, scraper) 或 (None, None)。"""
+        if 'm.usps.com/m/TrackConfirmAction' in url and 'tLabels' in url:
+            return 'm', self.scraper_m
+        if 'tools.usps.com/tracking/' in url and 'tLabels' in url:
+            return 'd', self.scraper_d
+        return None, None
 
     async def response(self, flow: http.HTTPFlow):
         try:
@@ -218,15 +239,16 @@ class USPSAddon:
                     if h in flow.response.headers:
                         del flow.response.headers[h]
 
-            if self.scraper.is_target_response_url(url):
+            mode, scraper = self._match(url)
+            if scraper is not None:
                 body = _safe_text(flow.response)
                 if body is None:
                     return
-                parsed = self.scraper.parse(body)
+                parsed = scraper.parse(body)
 
                 if DUMP_TARGET and not parsed:
                     self._dump_n += 1
-                    fn = f'_dump_{self.scraper.mode}_{self._dump_n}.html'
+                    fn = f'_dump_{mode}_{self._dump_n}.html'
                     try:
                         with open(fn, 'w', encoding='utf-8') as f:
                             f.write(body)
@@ -236,14 +258,14 @@ class USPSAddon:
 
                 if parsed:
                     self.total_success += 1
-                    self.retry_counts.pop(self.scraper.first_label(url), None)
+                    self.retry_counts.pop(scraper.first_label(url), None)
                     logger.info(
-                        f"✅ 解析成功 {len(parsed)} 条 | 首条 {parsed[0]} | "
+                        f"✅[{mode}] 解析成功 {len(parsed)} 条 | 首条 {parsed[0]} | "
                         f"累计 ✅{self.total_success}/🛡️{self.total_challenge}/⚠️{self.total_empty}"
                     )
-                    asyncio.create_task(self.scraper.原始请求提交到缓存(parsed))
-                    flow.response.text = _REDIRECT_TO_NEXT
-                    flow.response.headers["content-type"] = "text/html; charset=utf-8"
+                    asyncio.create_task(scraper.原始请求提交到缓存(parsed))
+                    flow.response = http.Response.make(
+                        200, _redirect_to_next(mode).encode(), {"Content-Type": "text/html; charset=utf-8"})
                     return
 
                 # 挑战页/中间页: 让 Chrome 自己跑通挑战, 同时注入指纹伪装
@@ -251,31 +273,30 @@ class USPSAddon:
                        ('/_sec/verify', 'bm-verify', 'Object.defineProperty(document',
                         '_sec/cp_challenge', 'ISTL-REDIRECT-TO', "addEventListener('afterReady'")):
                     self.total_challenge += 1
-                    logger.info(f"🛡️ 挑战页, 交给 Chrome 自动通过 (len={len(body)})")
+                    logger.info(f"🛡️[{mode}] 挑战页, 交给 Chrome 自动通过 (len={len(body)})")
                     if STEALTH and is_html and body:
                         flow.response.text = _inject_stealth(body)
                     return
 
                 # 非挑战的空页: USPS 偶发没出数据, 刷新重试当前这批(不取新单号)
-                key = self.scraper.first_label(url)
+                key = scraper.first_label(url)
                 cnt = self.retry_counts.get(key, 0) + 1
                 if cnt <= MAX_REFRESH:
                     self.retry_counts[key] = cnt
-                    logger.info(f"🔄 解析为空(len={len(body)}), 第 {cnt}/{MAX_REFRESH} 次刷新重试当前批")
+                    logger.info(f"🔄[{mode}] 解析为空(len={len(body)}), 第 {cnt}/{MAX_REFRESH} 次刷新重试当前批")
                     refresh_html = (
                         f'<!doctype html><html><head>'
                         f'<meta http-equiv="refresh" content="1;url={url}">'
                         f'</head><body>retry</body></html>'
                     )
-                    # 用 make(200) 整体替换: 原响应可能非 200(空/中断), 否则浏览器不会执行刷新
                     flow.response = http.Response.make(
                         200, refresh_html.encode(), {"Content-Type": "text/html; charset=utf-8"})
                 else:
                     self.retry_counts.pop(key, None)
-                    self.total_empty += 1   # 刷满上限仍没数据, 才算一次真失败
-                    logger.info(f"⚠️ 刷新 {MAX_REFRESH} 次仍为空, 放弃该批, 取下一批")
+                    self.total_empty += 1
+                    logger.info(f"⚠️[{mode}] 刷新 {MAX_REFRESH} 次仍为空, 放弃该批, 取下一批")
                     flow.response = http.Response.make(
-                        200, _REDIRECT_TO_NEXT.encode(), {"Content-Type": "text/html; charset=utf-8"})
+                        200, _redirect_to_next(mode).encode(), {"Content-Type": "text/html; charset=utf-8"})
                 return
 
             # 其它 HTML(挑战相关页 / iframe)也注入指纹伪装
@@ -310,11 +331,12 @@ def start_chrome(user_data_dir: str) -> subprocess.Popen:
         args += ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--log-level=3']
     if HEADLESS:
         args.append('--headless=new')
-    if MODE == 'm':
-        args.append('--user-agent=Emb/And/1.0')
-    # 传 N 个调度地址 -> Chrome 开 N 个顶层标签页, 每个独立自驱动循环(共享同一 profile 的 cookie)
-    args.extend([DISPATCH_URL] * TABS)
-    logger.info(f"启动命令行 Chrome ... ({TABS} 个标签页)")
+    # 不设全局 --user-agent: 桌面标签用 Chrome 默认 UA; 手机标签由 mitmproxy 按 m.usps.com 域名改 UA
+    urls = [dispatch_url('d')] * TABS_D + [dispatch_url('m')] * TABS_M
+    if not urls:
+        urls = [dispatch_url('d')]
+    args.extend(urls)
+    logger.info(f"启动命令行 Chrome ... ({TABS_D}个d + {TABS_M}个m = {len(urls)} 标签页)")
     logger.info(f"   CHROME_PATH={CHROME_PATH} (存在={os.path.exists(CHROME_PATH)}) | user_data_dir={user_data_dir}")
     return subprocess.Popen(args)
 
@@ -361,18 +383,17 @@ def stop_chrome(proc: Optional[subprocess.Popen], user_data_dir: str):
 # ============================== 入口 ==============================
 
 async def _main():
-    if MODE not in ('m', 'd'):
-        logger.error(f"非法 MODE={MODE}")
-        return
     if NUM_TYPE not in ('mysql', 'big'):
         logger.error(f"非法 NUM_TYPE={NUM_TYPE}")
+        return
+    if TABS_D + TABS_M <= 0:
+        logger.error("TABS_D 与 TABS_M 不能都为 0")
         return
     if not os.path.exists(CHROME_PATH):
         logger.error(f"找不到 Chrome: {CHROME_PATH} (可用 CHROME_PATH 指定)")
         return
 
-    scraper = UspsScraper(mode=MODE, num_type=NUM_TYPE)
-    addon = USPSAddon(scraper)
+    addon = USPSAddon(NUM_TYPE)
 
     # 代理环境变量诊断(PyCharm 等可能注入, 一般不影响 Chrome, 但打印出来便于排查)
     proxy_envs = {k: os.environ.get(k) for k in
@@ -404,8 +425,8 @@ async def _main():
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     master.addons.add(addon)
     mitm_task = asyncio.create_task(master.run())
-    logger.info(f"🚀 mitmproxy 已启动 127.0.0.1:{MITM_PORT} | mode={MODE} num_type={NUM_TYPE} "
-                f"tabs={TABS} headless={HEADLESS} run_seconds={RUN_SECONDS}")
+    logger.info(f"🚀 mitmproxy 已启动 127.0.0.1:{MITM_PORT} | num_type={NUM_TYPE} "
+                f"tabs={TABS_D}d+{TABS_M}m headless={HEADLESS} run_seconds={RUN_SECONDS}")
     await asyncio.sleep(1.5)
 
     # 确认 mitmproxy 真的起来了(bind 失败等会让 task 提前结束)
