@@ -1,0 +1,80 @@
+name: USPS MITM Tracker
+
+# 触发方式:
+#  - workflow_dispatch: 手动触发, 也是"链式接力"自触发入口
+#  - schedule: 兜底定时唤醒(GitHub 定时不可靠, 主要靠下面的接力维持)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  actions: write   # 需要写权限才能用 gh 触发下一轮
+
+# 并发互斥: 同一时刻只允许一个 workflow run, 下一轮排队等当前轮结束再开始
+concurrency:
+  group: usps-mitm
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        # 每个 instance = 一个独立 runner(独立 IP), 内部再用 TABS 个标签页并行
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    env:
+      MODE: d            # d=桌面 m=手机
+      NUM_TYPE: big      # big / mysql
+      TABS: "5"          # 每个 runner 内并行标签页数
+      RUN_SECONDS: "300" # 跑 5 分钟后优雅退出
+      HEADLESS: "false"  # 配合 xvfb 跑"有头" Chrome, 更易过 Akamai
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装系统依赖(xvfb; Chrome 已预装)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: 安装 Python 依赖
+        run: pip install -r requirements_mitm.txt
+
+      - name: 运行(xvfb 虚拟显示器 + 有头 Chrome)
+        run: xvfb-run -a python mitm_usps.py
+
+  # 链式接力 + 清理: 无论本轮结果如何都触发下一轮, 保持心跳不熄火
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 触发下一轮(保持心跳)
+        env:
+          # 注意: 必须用 PAT, GITHUB_TOKEN 触发的 workflow 不会再触发新 run(GitHub 限制)
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh workflow run "USPS MITM Tracker" --ref "${{ github.ref_name }}"
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" \
+            --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"

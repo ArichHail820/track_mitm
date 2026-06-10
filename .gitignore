@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+_dump_*.html
+_decoy_profile/
+*.log
+usps_token_cache.json
