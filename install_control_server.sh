@@ -295,11 +295,12 @@ ExecStart=${APP_DIR}/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port ${LIS
           --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
 Restart=always
 RestartSec=3
-NoNewPrivileges=true
+# exitctl 仍为非 root；这里必须允许它通过严格 sudoers 调用唯一的 HY2 root helper。
+NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR}
+ReadWritePaths=${DATA_DIR} /var/lib/exit-node-hy2
 
 [Install]
 WantedBy=multi-user.target
