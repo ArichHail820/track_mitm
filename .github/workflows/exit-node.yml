@@ -1,0 +1,320 @@
+name: exit node
+
+# 单个出口节点 = 单个 workflow run = 单个并发名额。
+#
+# 和旧的 frpc-node.yml / gost-node.yml 相比,这里没有 matrix、没有 guard、没有 relay,
+# 也没有 schedule 看门狗:调度权全部收到控制服务端的 reconcile 循环里。本文件只做一件事 ——
+# 当一个被派发的租约,老实汇报状态,收到"待回收"就干净退出。
+#
+# 端口不再靠随机抢 + grep 日志判断,而是由服务器直接分配(它有全局视图,无竞态)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      lease_id:
+        description: "控制服务端下发的租约 ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write          # 用于换取 OIDC 令牌。服务器 OIDC_ENABLED=0 时该令牌被忽略,
+                           # 打开时无需改动本文件。
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    # 覆盖 HARD_LIFETIME(1800s) + 建隧道 + 余量。真正的寿命由服务器控制,
+    # 这里只是防"服务器彻底失联导致 runner 无限期烧分钟数"的最后一道闸。
+    timeout-minutes: 35
+
+    env:
+      GOST_VERSION: "3.2.6"
+      CONTROL_URL: ${{ secrets.CONTROL_URL }}      # 形如 https://ctl.example.com
+      NODE_TOKEN: ${{ secrets.NODE_TOKEN }}        # 与服务器 NODE_TOKEN 一致
+      OIDC_AUDIENCE: "exit-node-pool"              # 与服务器 OIDC_AUDIENCE 一致
+      SERVER_ADDR: ${{ secrets.FRP_SERVER_ADDR }}  # gost relay 所在服务器公网 IP
+      RELAY_PORT: "8443"
+      RELAY_USER: "node"
+      GOST_TOKEN: ${{ secrets.GOST_TOKEN }}        # 与 install_server_gost.sh 的 TOKEN 一致
+      LEASE_ID: ${{ inputs.lease_id }}
+      BIND_TIMEOUT: "45"                           # 单次绑定等待上限(秒)
+      MAX_BIND_ATTEMPTS: "3"                       # 绑定失败最多向服务器换几次端口
+
+    steps:
+      - name: 安装 gost
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz" \
+            -o gost.tar.gz
+          tar -xzf gost.tar.gz
+          chmod +x ./gost
+          ./gost -V || true
+
+      - name: 建隧道并服务到被回收
+        run: |
+          # 故意不用 -e:所有 curl 失败都要自己处理,不能因为一次网络抖动就让 job 异常退出
+          set -uo pipefail
+
+          RUN_ID="${GITHUB_RUN_ID}"
+          WORKDIR="$(pwd)"
+          echo "pending" > "${WORKDIR}/phase"
+          rm -f "${WORKDIR}/recycle" "${WORKDIR}/stop"
+
+          # ---------- OIDC(第二因子,服务器可选校验) ----------
+          OIDC_TOKEN=""
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            OIDC_TOKEN="$(curl -sS -m 10 \
+              -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" \
+              | jq -r '.value // empty')" || OIDC_TOKEN=""
+          fi
+
+          hdrs=(-H "Authorization: Bearer ${NODE_TOKEN}" -H "Content-Type: application/json")
+          if [ -n "${OIDC_TOKEN}" ]; then
+            hdrs+=(-H "X-GHA-OIDC: ${OIDC_TOKEN}")
+          fi
+
+          # api <path> <json>  ->  stdout 是 HTTP 状态码,响应体写入 $RESP_FILE
+          #
+          # 注意:状态码必须走 stdout 返回。如果在函数里给全局变量赋值,调用方一旦用
+          # $(...) 包起来就进了子 shell,赋值会被丢掉 —— 那样所有状态码判断都会失效。
+          RESP_FILE="${WORKDIR}/resp.main"
+          api() {
+            local path="$1" payload="$2" code
+            code="$(curl -sS -m 12 -X POST "${CONTROL_URL}${path}" \
+                      "${hdrs[@]}" -d "${payload}" \
+                      -o "${RESP_FILE}" -w '%{http_code}' 2>/dev/null)" || code=""
+            printf '%s' "${code:-000}"
+          }
+
+          jqr() { jq -r "$1" "${RESP_FILE}" 2>/dev/null || echo ""; }
+
+          bye() {
+            local code
+            code="$(api /v1/bye "$(jq -nc --arg l "$LEASE_ID" --arg r "${1:-node_exit}" \
+                                    '{lease_id:$l, reason:$r}')")"
+            echo "已告别控制服务端: reason=${1:-node_exit} HTTP=${code}"
+          }
+
+          # ---------- 1. 注册,拿服务器分配的端口 ----------
+          RUNNER_IP="$(curl -sS -m 10 https://api.ipify.org 2>/dev/null || echo '')"
+          echo "本节点出口 IP: ${RUNNER_IP:-未知}"
+
+          register() {   # $1 = rebind(true/false),回显状态码
+            local body
+            body="$(jq -nc --arg l "$LEASE_ID" --arg r "$RUN_ID" --arg ip "$RUNNER_IP" \
+                      --argjson rb "$1" \
+                      '{lease_id:$l, run_id:$r, runner_ip:$ip, rebind:$rb}')"
+            api /v1/register "$body"
+          }
+
+          code="$(register false)"
+          if [ "$code" != "200" ]; then
+            echo "注册被拒绝 HTTP=${code}: $(cat "${RESP_FILE}" 2>/dev/null)"
+            echo "服务器不认这个租约,直接结束本任务(reconcile 会重新派单)"
+            exit 0
+          fi
+          if [ "$(jqr '.action // "keep"')" = "recycle" ]; then
+            echo "注册即被判回收: $(jqr '.reason // ""')"
+            exit 0
+          fi
+
+          PORT="$(jqr '.port')"
+          HB="$(jqr '.heartbeat_interval // 5')"
+          case "$PORT" in
+            ''|*[!0-9]*) echo "服务器返回的端口非法: ${PORT}"; bye "bad_port"; exit 0 ;;
+          esac
+          echo "$PORT" > "${WORKDIR}/port"
+          echo "服务器分配端口 ${PORT},心跳间隔 ${HB}s,当前状态 = 2 待使用"
+
+          # ---------- 2. 后台心跳(注册后立刻开始,涵盖建隧道阶段) ----------
+          # 心跳自描述:每次都带全量身份(lease_id / run_id / port / 节点自认的阶段)。
+          # 服务器因此可以在重启后靠心跳把状态重建出来,不依赖自己的历史内存。
+          (
+            RESP_FILE="${WORKDIR}/resp.hb"   # 子 shell 用独立文件,避免和主流程互相覆盖
+            fails=0
+            while [ ! -f "${WORKDIR}/stop" ]; do
+              ph="$(cat "${WORKDIR}/phase" 2>/dev/null || echo pending)"
+              pt="$(cat "${WORKDIR}/port" 2>/dev/null || echo '')"
+              hb_body="$(jq -nc --arg l "$LEASE_ID" --arg r "$RUN_ID" --arg p "$ph" \
+                           --argjson port "${pt:-null}" \
+                           '{lease_id:$l, run_id:$r, node_phase:$p, port:$port}')"
+              hc="$(api /v1/heartbeat "$hb_body")"
+              case "$hc" in
+                200)
+                  fails=0
+                  if [ "$(jqr '.action // "keep"')" = "recycle" ]; then
+                    jqr '.reason // "recycle"' > "${WORKDIR}/recycle"
+                    echo "心跳收到状态 3 待回收"
+                    break
+                  fi
+                  ;;
+                409)
+                  fails=0
+                  jqr '.reason // "conflict"' > "${WORKDIR}/recycle"
+                  echo "心跳返回 409,服务器已不认这个租约"
+                  break
+                  ;;
+                *)
+                  fails=$((fails + 1))
+                  echo "心跳失败 HTTP=${hc},连续第 ${fails} 次"
+                  # 服务器长时间不可达就自杀:它已经没法 cancel 我了,别白烧 Actions 分钟数
+                  if [ "$fails" -ge 60 ]; then
+                    echo "control_unreachable" > "${WORKDIR}/recycle"
+                    break
+                  fi
+                  ;;
+              esac
+              sleep "$HB"
+            done
+          ) &
+          HB_PID=$!
+
+          GOST_PID=""
+          cleanup() {
+            touch "${WORKDIR}/stop"
+            if [ -n "${GOST_PID}" ]; then kill "${GOST_PID}" 2>/dev/null || true; fi
+            kill "${HB_PID}" 2>/dev/null || true
+            wait 2>/dev/null || true
+          }
+
+          # ---------- 3. 起 gost 反向隧道 ----------
+          # 用配置文件而不是 rtcp://:PORT/... 的紧凑 CLI 写法:后者会把绑定地址拼成
+          # 0.0.0.0::PORT 这种非法形式,bind 必然失败。
+          write_cfg() {
+            cat > node.yaml <<EOF
+          services:
+          - name: socks
+            addr: "127.0.0.1:1080"
+            handler:
+              type: socks5
+            listener:
+              type: tcp
+          - name: reverse
+            addr: "127.0.0.1:$1"
+            handler:
+              type: rtcp
+            listener:
+              type: rtcp
+              chain: relay
+            forwarder:
+              nodes:
+              - name: socks-local
+                addr: "127.0.0.1:1080"
+          chains:
+          - name: relay
+            hops:
+            - name: hop
+              nodes:
+              - name: server
+                addr: "${SERVER_ADDR}:${RELAY_PORT}"
+                connector:
+                  type: relay
+                  auth:
+                    username: ${RELAY_USER}
+                    password: ${GOST_TOKEN}
+                dialer:
+                  type: quic
+          EOF
+          }
+
+          bound=""
+          attempt=0
+          while [ "$attempt" -lt "$MAX_BIND_ATTEMPTS" ]; do
+            attempt=$((attempt + 1))
+            write_cfg "$PORT"
+            : > gost.log
+            ./gost -C node.yaml >> gost.log 2>&1 &
+            GOST_PID=$!
+
+            waited=0
+            while [ "$waited" -lt "$BIND_TIMEOUT" ]; do
+              if grep -q "bind on 127.0.0.1:${PORT}/tcp OK" gost.log 2>/dev/null; then
+                bound="$PORT"
+                break
+              fi
+              if ! kill -0 "$GOST_PID" 2>/dev/null; then
+                echo "gost 进程提前退出:"
+                tail -n 20 gost.log
+                break
+              fi
+              if [ -f "${WORKDIR}/recycle" ]; then
+                echo "建隧道期间收到回收指令,提前收工"
+                break
+              fi
+              sleep 2
+              waited=$((waited + 2))
+            done
+
+            if [ -n "$bound" ] || [ -f "${WORKDIR}/recycle" ]; then
+              break
+            fi
+
+            echo "端口 ${PORT} 绑定失败(第 ${attempt} 次),向服务器申请换端口"
+            kill "$GOST_PID" 2>/dev/null || true
+            wait "$GOST_PID" 2>/dev/null || true
+            GOST_PID=""
+
+            code="$(register true)"
+            if [ "$code" != "200" ] || [ "$(jqr '.action // "keep"')" = "recycle" ]; then
+              echo "换端口被拒绝 HTTP=${code}: $(cat "${RESP_FILE}" 2>/dev/null)"
+              break
+            fi
+            PORT="$(jqr '.port')"
+            echo "$PORT" > "${WORKDIR}/port"
+            echo "改用端口 ${PORT}"
+          done
+
+          if [ -z "$bound" ]; then
+            reason="bind_failed"
+            if [ -f "${WORKDIR}/recycle" ]; then reason="$(cat "${WORKDIR}/recycle")"; fi
+            echo "未能建立隧道,退出(服务器会补一个新节点)"
+            cleanup
+            bye "$reason"
+            exit 0
+          fi
+
+          # ---------- 4. 上报 ready -> 进入状态 1 使用中 ----------
+          echo "in_use" > "${WORKDIR}/phase"
+          code="$(api /v1/ready "$(jq -nc --arg l "$LEASE_ID" --argjson p "$PORT" \
+                                    '{lease_id:$l, port:$p}')")"
+          if [ "$code" != "200" ] || [ "$(jqr '.action // "keep"')" = "recycle" ]; then
+            echo "ready 被拒绝 HTTP=${code}: $(cat "${RESP_FILE}" 2>/dev/null)"
+            cleanup
+            bye "ready_rejected"
+            exit 0
+          fi
+          echo "已进入状态 1 使用中:端口 ${PORT} / 出口 IP ${RUNNER_IP}"
+          echo "软寿命剩余 $(jqr '.soft_deadline_in')s / 硬寿命剩余 $(jqr '.hard_deadline_in')s"
+
+          # ---------- 5. 服务,直到被回收 ----------
+          reason=""
+          while true; do
+            if [ -f "${WORKDIR}/recycle" ]; then
+              reason="$(cat "${WORKDIR}/recycle")"
+              echo "收到状态 3 待回收(${reason}),结束本任务"
+              break
+            fi
+            if ! kill -0 "$GOST_PID" 2>/dev/null; then
+              reason="tunnel_down"
+              echo "gost 隧道意外中断:"
+              tail -n 20 gost.log
+              break
+            fi
+            if ! kill -0 "$HB_PID" 2>/dev/null; then
+              reason="heartbeat_stopped"
+              echo "心跳协程已退出"
+              break
+            fi
+            sleep 2
+          done
+
+          # ---------- 6. 干净退出 ----------
+          # 先停 gost 再 bye:等服务器归还名额时,这个端口上确实已经没有连接了。
+          # bye 让名额归还从"等 DRAIN_TIMEOUT 超时"变成约 0 秒,是很便宜的一大笔容量收益。
+          cleanup
+          bye "${reason:-node_exit}"
+          echo "节点退出完毕,端口 ${PORT} 已交还"
+          exit 0

@@ -1,0 +1,169 @@
+name: frpc exit nodes
+
+# 每个 GitHub runner = 一个独立出口 IP,作为 frpc 节点接入服务器的 frps。
+# 动态抢空端口 + 错峰退出 + 滚动接力,尽量消除换批空窗。
+# 【已停用,仅作手动兜底保留】调度权已移交 control-server 的 reconcile 循环,
+# 见 exit-node.yml。schedule 必须关掉:否则它每 15 分钟播种 19 个 job,会和新调度
+# 抢同一批 20 个账号级并发名额,两边都补不满。
+on:
+  workflow_dispatch:
+  # 看门狗: 仅当接力链断了才重新播种(见下方 guard 作业),避免叠出多条并行链路
+  # schedule:
+  #   - cron: "*/15 * * * *"
+
+permissions:
+  actions: write
+
+# 注意: 这里"故意不加 concurrency 互斥",让上一轮还在排空时下一轮就能开始排队/补位,
+# 实现滚动替换。靠 RUN_SECONDS(每个 runner 寿命)给整条链限速,relay 每轮只触发一次下一轮,
+# guard 又挡住 schedule 的重复播种,因此在飞的轮次被限制在约 2 轮,不会无限堆叠。
+
+jobs:
+  # 守门: dispatch(手动/relay自触发)永远放行; schedule 仅在链路已断时才放行,防多链路
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      go: ${{ steps.g.outputs.go }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          active=$(gh api "repos/$REPO/actions/workflows/frpc-node.yml/runs?per_page=50" \
+            --jq "[.workflow_runs[] | select(.status==\"in_progress\" or .status==\"queued\") | select(.id != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+          if [ "${active:-0}" -gt 0 ]; then
+            echo "链路存活(${active} 个在跑/排队), 本次 schedule 不播种"; echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "链路已断, 重新播种"; echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  node:
+    needs: guard
+    if: ${{ needs.guard.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        # 19 个节点 + 1 个 relay = 20,正好占满免费账号并发上限(guard 秒级结束不长占名额)
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      FRP_VERSION: "0.61.1"
+      SERVER_ADDR: ${{ secrets.FRP_SERVER_ADDR }}
+      FRP_PORT: "7000"
+      FRP_TOKEN: ${{ secrets.FRP_TOKEN }}
+      BASE_PORT: "20000"
+      POOL_SIZE: "60"          # 必须与服务器 install_server.sh 的 POOL_SIZE 一致
+      RUN_SECONDS: "300"       # 单个 runner 基础寿命(5 分钟)
+      STAGGER_SECONDS: "8"     # 错峰: instance 越大多活几秒,让退出分散开,避免同时全退
+    steps:
+      - name: 安装 frpc
+        run: |
+          set -e
+          curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz" -o frp.tar.gz
+          tar -xzf frp.tar.gz
+          mv "frp_${FRP_VERSION}_linux_amd64/frpc" ./frpc
+          chmod +x ./frpc
+
+      - name: 抢一个空端口并维持连接
+        run: |
+          set -u
+          NODE_ID="${{ matrix.instance }}"
+          LIFETIME=$((RUN_SECONDS + NODE_ID * STAGGER_SECONDS))
+          FRPC_PID=""
+
+          write_config() {
+            local port="$1"
+            {
+              echo "serverAddr = \"${SERVER_ADDR}\""
+              echo "serverPort = ${FRP_PORT}"
+              echo "auth.method = \"token\""
+              echo "auth.token = \"${FRP_TOKEN}\""
+              echo "loginFailExit = false"
+              echo "webServer.addr = \"127.0.0.1\""
+              echo "webServer.port = 7400"
+              echo ""
+              echo "[[proxies]]"
+              echo "name = \"exit-${port}\""
+              echo "type = \"tcp\""
+              echo "remotePort = ${port}"
+              echo ""
+              echo "[proxies.plugin]"
+              echo "type = \"socks5\""
+            } > frpc.toml
+          }
+
+          # 探测某端口在服务器上是否已被占用: 连得上=占用(别的节点的 socks 在听), 拒绝=空闲
+          port_taken() {
+            timeout 2 bash -c "exec 3<>/dev/tcp/${SERVER_ADDR}/$1" 2>/dev/null && { exec 3>&- 2>/dev/null || true; return 0; } || return 1
+          }
+
+          # 反复挑端口直到成功注册
+          got_port=""
+          for attempt in $(seq 1 60); do
+            PORT=$((BASE_PORT + 1 + RANDOM % POOL_SIZE))
+            if port_taken "$PORT"; then
+              continue   # 已被占用, 换一个
+            fi
+            write_config "$PORT"
+            ./frpc -c frpc.toml > frpc.log 2>&1 &
+            FRPC_PID=$!
+            sleep 5
+            # 用 frpc 自带 status 校验代理是否 running(端口被并发抢走时会是 error)
+            if ./frpc status -c frpc.toml 2>/dev/null | grep -q "running"; then
+              got_port="$PORT"
+              echo "node${NODE_ID} 抢到端口 ${PORT}, 寿命 ${LIFETIME}s"
+              break
+            fi
+            # 失败 -> 杀掉重试
+            kill "$FRPC_PID" 2>/dev/null || true
+            wait "$FRPC_PID" 2>/dev/null || true
+            FRPC_PID=""
+            sleep 1
+          done
+
+          if [ -z "$got_port" ]; then
+            echo "未抢到空端口(端口池可能已满), 本节点本轮退出"
+            exit 0
+          fi
+
+          # 维持到寿命到期, 期间 frpc 若掉线会自己重连(loginFailExit=false)
+          sleep "$LIFETIME"
+          echo "node${NODE_ID} 寿命到期, 优雅退出, 释放端口 ${got_port}"
+          kill "$FRPC_PID" 2>/dev/null || true
+          wait "$FRPC_PID" 2>/dev/null || true
+
+  # 接力: 每轮触发一次下一轮。下一轮的 job 会排队等本轮节点错峰退出腾名额时逐个补位 -> 滚动替换。
+  relay:
+    needs: guard
+    if: ${{ needs.guard.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 触发下一轮
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          for i in 1 2 3; do
+            gh workflow run "frpc exit nodes" --ref "${{ github.ref_name }}" -R "${{ github.repository }}" && break
+            echo "触发失败, 重试 ($i)"; sleep 5
+          done
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"

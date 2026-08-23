@@ -1,0 +1,21 @@
+# frpc 配置模板(住宅节点)
+# 把 {{...}} 占位符替换成实际值。install_node.sh 会自动生成。
+# remotePort = 20000 + NODE_ID,需与服务器 mihomo 里的 node{NODE_ID} 对应。
+
+serverAddr = "{{SERVER_ADDR}}"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "{{TOKEN}}"
+
+# 该节点对外暴露成服务器上的一个 socks5 代理
+[[proxies]]
+name = "node{{NODE_ID}}-socks"
+type = "tcp"
+remotePort = {{REMOTE_PORT}}
+
+[proxies.plugin]
+type = "socks5"
+# 如需给 socks5 加账号密码(建议公网时开启,并在 mihomo proxies 里同步填 username/password):
+# username = "u"
+# password = "p"

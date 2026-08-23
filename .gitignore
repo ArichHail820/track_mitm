@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 本地运行产物(生产环境在 /var/lib/exit-node-control/)
+*.db
+*.db-wal
+*.db-shm
+*.env
+
+# 本地部署临时文件与备份（可能包含敏感运维输出）
+_tmp/
+备份/

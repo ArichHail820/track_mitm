@@ -1,0 +1,172 @@
+name: gost exit nodes
+
+# 每个 GitHub runner = 一个独立出口 IP,用 gost 反向隧道(relay+quic)接入服务器的 gost relay。
+# 取代 frpc 版:服务器↔节点改用 QUIC,避免 frp 的 TCP-over-TCP 把 TLS ClientHello 拆段被 Akamai 风控。
+# 动态抢空端口 + 错峰退出 + 滚动接力,尽量消除换批空窗。
+#
+# 【已停用,仅作手动兜底保留】调度权已移交 control-server 的 reconcile 循环,
+# 见 exit-node.yml。schedule 必须关掉:否则它每 15 分钟播种 19 个 job,会和新调度
+# 抢同一批 20 个账号级并发名额,两边都补不满。
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: "*/15 * * * *"
+
+permissions:
+  actions: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      go: ${{ steps.g.outputs.go }}
+    steps:
+      - id: g
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          active=$(gh api "repos/$REPO/actions/workflows/gost-node.yml/runs?per_page=50" \
+            --jq "[.workflow_runs[] | select(.status==\"in_progress\" or .status==\"queued\") | select(.id != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+          if [ "${active:-0}" -gt 0 ]; then
+            echo "链路存活(${active} 个在跑/排队), 本次 schedule 不播种"; echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "链路已断, 重新播种"; echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  node:
+    needs: guard
+    if: ${{ needs.guard.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      GOST_VERSION: "3.2.6"
+      SERVER_ADDR: ${{ secrets.FRP_SERVER_ADDR }}   # 复用原 IP secret
+      RELAY_PORT: "8443"
+      RELAY_USER: "node"
+      TOKEN: ${{ secrets.GOST_TOKEN }}              # 与服务器 install_server_gost.sh 的 TOKEN 一致
+      BASE_PORT: "20000"
+      POOL_SIZE: "60"
+      RUN_SECONDS: "300"
+      STAGGER_SECONDS: "8"
+    steps:
+      - name: 安装 gost
+        run: |
+          set -e
+          curl -fsSL "https://github.com/go-gost/gost/releases/download/v${GOST_VERSION}/gost_${GOST_VERSION}_linux_amd64.tar.gz" -o gost.tar.gz
+          tar -xzf gost.tar.gz
+          chmod +x ./gost
+
+      - name: 反向抢端口并维持(配置文件方式)
+        run: |
+          set -u
+          NODE_ID="${{ matrix.instance }}"
+          LIFETIME=$((RUN_SECONDS + NODE_ID * STAGGER_SECONDS))
+
+          # 用配置文件,不用 CLI 的 rtcp://:PORT/... 紧凑写法(那种写法会把绑定地址拼成
+          # 0.0.0.0::PORT 非法地址导致 bind 失败)。这里把 socks5 + rtcp 反向隧道写全。
+          write_cfg() {
+            local port="$1"
+            # 注意:heredoc 内容必须缩进到与 run 块的基准缩进齐平(这里是 10 空格)。
+            # 顶格写会让 YAML 的块标量在此处被截断,整个 workflow 文件都无法解析。
+            cat > node.yaml <<EOF
+          services:
+          - name: socks
+            addr: "127.0.0.1:1080"
+            handler:
+              type: socks5
+            listener:
+              type: tcp
+          - name: reverse
+            addr: "127.0.0.1:${port}"
+            handler:
+              type: rtcp
+            listener:
+              type: rtcp
+              chain: relay
+            forwarder:
+              nodes:
+              - name: socks-local
+                addr: "127.0.0.1:1080"
+          chains:
+          - name: relay
+            hops:
+            - name: hop
+              nodes:
+              - name: server
+                addr: "${SERVER_ADDR}:${RELAY_PORT}"
+                connector:
+                  type: relay
+                  auth:
+                    username: ${RELAY_USER}
+                    password: ${TOKEN}
+                dialer:
+                  type: quic
+          EOF
+          }
+
+          GOST_PID=""; got=""
+          for attempt in $(seq 1 60); do
+            PORT=$((BASE_PORT + 1 + RANDOM % POOL_SIZE))
+            write_cfg "$PORT"
+            ./gost -C node.yaml > gost.log 2>&1 &
+            GOST_PID=$!
+            sleep 6
+            # 绑定成功判据: gost 日志出现 "bind on 127.0.0.1:PORT/tcp OK"
+            if grep -q "bind on 127.0.0.1:${PORT}/tcp OK" gost.log 2>/dev/null; then
+              got="$PORT"
+              echo "node${NODE_ID} 反向绑定端口 ${PORT} 成功, 寿命 ${LIFETIME}s"
+              break
+            fi
+            echo "端口 ${PORT} 绑定失败/被占, 换一个"; tail -n 3 gost.log || true
+            kill "$GOST_PID" 2>/dev/null || true; wait "$GOST_PID" 2>/dev/null || true; GOST_PID=""
+            sleep 1
+          done
+
+          if [ -z "$got" ]; then
+            echo "未抢到空端口(端口池可能已满), 本节点本轮退出"
+            exit 0
+          fi
+
+          # 维持到寿命到期
+          sleep "$LIFETIME"
+          echo "node${NODE_ID} 寿命到期, 释放端口 ${got}"
+          kill "$GOST_PID" 2>/dev/null || true
+          wait 2>/dev/null || true
+
+  relay:
+    needs: guard
+    if: ${{ needs.guard.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 触发下一轮
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          for i in 1 2 3; do
+            gh workflow run "gost exit nodes" --ref "${{ github.ref_name }}" -R "${{ github.repository }}" && break
+            echo "触发失败, 重试 ($i)"; sleep 5
+          done
+
+      - name: 清理已完成的历史 run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ids=$(gh api "repos/$REPO/actions/runs?status=completed&per_page=100" --jq '.workflow_runs[].id')
+          for id in $ids; do
+            if [ "$id" != "$CURRENT_RUN_ID" ]; then
+              gh api -X DELETE "repos/$REPO/actions/runs/$id" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "cleanup done"

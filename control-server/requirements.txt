@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic==2.10.4
+# 仅在 OIDC_ENABLED=1 时用到,装上不影响默认行为
+PyJWT[crypto]==2.10.1
