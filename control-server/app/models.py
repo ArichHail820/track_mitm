@@ -14,13 +14,30 @@ from enum import Enum
 
 
 class State(str, Enum):
-    """服务器视角的内部状态。"""
+    """服务器视角的 runner 内部状态。"""
 
     DISPATCHED = "dispatched"  # 已调 dispatch,runner 可能还在 GitHub 队列里排队
-    PENDING = "pending"        # runner 已注册,正在装 gost / 建隧道 —— 对外的"待使用"
-    IN_USE = "in_use"          # ready 已上报,端口已通,在出口池里服务 —— 对外的"使用中"
-    DRAINING = "draining"      # 服务器已判死刑,等节点自己退出 —— 对外的"待回收"
+    PENDING = "pending"        # runner 已注册,正在装 gost / 建隧道
+    IN_USE = "in_use"          # ready 已上报,隧道可分配给客户端
+    DRAINING = "draining"      # 服务器已判死刑,等节点自己退出
     DEAD = "dead"              # 终态,端口与并发名额已归还
+
+
+class ClientState(str, Enum):
+    """浏览器侧独占会话状态，与 runner 生命周期严格分离。"""
+
+    STARTING = "starting"      # 已原子占用 runner，正在启动独立 HY2 实例
+    ACTIVE = "active"          # 客户端可通过该 HY2 端口使用 runner
+    RELEASING = "releasing"    # 已停入口或正在停入口，等待 runner 完全退出
+    RELEASED = "released"      # 正常终态
+    FAILED = "failed"          # HY2 启动失败等异常终态
+
+
+CLIENT_LIVE_STATES: tuple[ClientState, ...] = (
+    ClientState.STARTING,
+    ClientState.ACTIVE,
+    ClientState.RELEASING,
+)
 
 
 #: 尚未结束、仍占用 GitHub 并发名额的状态
@@ -109,4 +126,40 @@ class Lease:
             "reason": self.reason,
             "register_count": self.register_count,
             "unconfirmed": self.unconfirmed,
+        }
+
+
+@dataclass
+class ClientSession:
+    """一个浏览器独占会话；凭据不持久化到 SQLite。"""
+
+    id: str = field(default_factory=new_lease_id)
+    request_id: str = ""
+    lease_id: str = ""
+    port: int = 0
+    state: ClientState = ClientState.STARTING
+    created_at: float = field(default_factory=now)
+    expires_at: float = 0.0
+    release_at: float | None = None
+    released_at: float | None = None
+    hy2_stopped_at: float | None = None
+    reason: str | None = None
+
+    @property
+    def is_live(self) -> bool:
+        return self.state in CLIENT_LIVE_STATES
+
+    def snapshot(self, t: float | None = None) -> dict:
+        t = t if t is not None else now()
+        return {
+            "session_id": self.id,
+            "lease_id": self.lease_id,
+            "port": self.port,
+            "state": self.state.value,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "ttl_remaining": round(max(0.0, self.expires_at - t), 1),
+            "release_at": self.release_at,
+            "released_at": self.released_at,
+            "reason": self.reason,
         }

@@ -23,7 +23,7 @@ import time
 
 from .config import Settings
 from .ghclient import GitHubClient
-from .models import Lease, State, now
+from .models import ClientState, Lease, State, now
 from .store import Store
 
 log = logging.getLogger("sched")
@@ -44,7 +44,7 @@ class Scheduler:
         self._cold_start_until = 0.0
         self._last_dispatch = 0.0
         self._dispatch_blocked_until = 0.0
-        self._cancel_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._cancel_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
         self._dispatch_queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
 
@@ -81,7 +81,10 @@ class Scheduler:
         self._workers = [
             asyncio.create_task(self._loop(), name="reconcile"),
             asyncio.create_task(self._dispatch_loop(), name="dispatcher"),
-            asyncio.create_task(self._cancel_loop(), name="canceller"),
+            *[
+                asyncio.create_task(self._cancel_loop(), name=f"canceller-{index}")
+                for index in range(3)
+            ],
             asyncio.create_task(self._janitor_loop(), name="janitor"),
         ]
 
@@ -127,38 +130,88 @@ class Scheduler:
         lease.drain_at = now()
         lease.reason = reason
         self.store.persist(lease)
+        self.store.request_release_for_lease(lease.id, f"runner_drain:{reason}")
         self.stats["drained"] += 1
         log.info("drain lease=%s port=%s ip=%s reason=%s",
                  lease.id[:8], lease.port, lease.runner_ip, reason)
 
     def kill(self, lease: Lease, reason: str, *, cancel_run: bool = False) -> None:
-        """终态:归还端口(进冷却)与并发名额。"""
+        """终态只在 runner 已退出或 GitHub 已确认 run 完成后写入。"""
         if lease.state is State.DEAD:
             return
+        if cancel_run:
+            if lease.state is not State.DRAINING:
+                self.drain(lease, reason)
+            self.request_cancel(lease)
+            return
+
+        session = self.store.live_session_for_lease(lease.id)
+        unsafe_port = session is not None and session.hy2_stopped_at is None
+        if unsafe_port:
+            self.store.ports.quarantine(lease.port)
         lease.state = State.DEAD
         lease.dead_at = now()
         lease.reason = reason
         self.store.ports.release(lease.port)
         self.store.persist(lease)
+        self.store.request_release_for_lease(lease.id, f"runner_dead:{reason}")
         self.stats["killed"] += 1
         log.info("kill  lease=%s port=%s ip=%s reason=%s",
                  lease.id[:8], lease.port, lease.runner_ip, reason)
-        if cancel_run and lease.run_id and not lease.cancel_requested:
+
+    def request_cancel(self, lease: Lease) -> None:
+        if not lease.cancel_requested and lease.state is not State.DEAD:
             lease.cancel_requested = True
-            self._cancel_queue.put_nowait(lease.run_id)
+            self._cancel_queue.put_nowait((lease.id, lease.run_id))
 
     async def _cancel_loop(self) -> None:
-        """异步强杀队列。放到后台是为了不让 GitHub API 的延迟卡住 reconcile。"""
+        """反复取消并查询，只有 GitHub 确认 completed 才写 DEAD、归还名额。"""
         while not self._stop.is_set():
             try:
-                run_id = await self._cancel_queue.get()
+                lease_id, run_id = await self._cancel_queue.get()
             except asyncio.CancelledError:
                 raise
-            try:
-                ok = await self.gh.cancel_run(run_id)
-                log.info("cancel run %s -> %s", run_id, "ok" if ok else "failed")
-            except Exception:
-                log.exception("cancel run %s 异常", run_id)
+            while not self._stop.is_set():
+                async with self.store.lock:
+                    lease = self.store.get(lease_id)
+                    if lease is None or lease.state is State.DEAD:
+                        break
+                if run_id is None:
+                    run_id = await self.gh.find_run_id(lease_id)
+                    if run_id is not None:
+                        async with self.store.lock:
+                            lease = self.store.get(lease_id)
+                            if lease is not None:
+                                lease.run_id = run_id
+                                self.store.persist(lease)
+                    else:
+                        log.warning("尚未找到 lease=%s 对应的 GitHub run，保持隔离", lease_id[:8])
+                        try:
+                            await asyncio.wait_for(self._stop.wait(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+                try:
+                    accepted = await self.gh.cancel_run(run_id)
+                    completed = await self.gh.run_completed(run_id)
+                except Exception:
+                    accepted = False
+                    completed = None
+                    log.exception("cancel/确认 run %s 异常，将重试", run_id)
+                if completed is True:
+                    async with self.store.lock:
+                        lease = self.store.get(lease_id)
+                        if lease is not None and lease.state is not State.DEAD:
+                            self.kill(lease, "github_run_completed")
+                    break
+                log.info(
+                    "等待 GitHub run %s 完成 accepted=%s status=%s",
+                    run_id, accepted, completed,
+                )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
 
     # ------------------------------------------------------------------ 主逻辑
 
@@ -212,7 +265,7 @@ class Scheduler:
                 # runner 始终没上线:可能被 GitHub 挤掉了,也可能 dispatch 落到了
                 # 一个立刻失败的 run。归还名额,让补位阶段重新派单。
                 if l.age(t) > s.dispatch_timeout:
-                    self.kill(l, "no_show")
+                    self.kill(l, "no_show", cancel_run=True)
 
             elif l.state is State.PENDING:
                 if l.hb_age(t) > s.hb_timeout_pending:
@@ -279,6 +332,9 @@ class Scheduler:
         for l in self._in_use_oldest_first():
             if in_use <= n_min:
                 break
+            # 独占会话有效期间绝不做软轮换；release/TTL 会主动销毁该 runner。
+            if self.store.has_live_session(l.id):
+                continue
             if l.in_use_age(t) > self.s.soft_lifetime:
                 self.drain(l, "rotate")
                 in_use -= 1
@@ -367,8 +423,12 @@ class Scheduler:
         )
 
     def _oldest_in_use(self) -> Lease | None:
-        xs = self._in_use_oldest_first()
-        return xs[0] if xs else None
+        # TTL 是对客户端的承诺，反死锁绝不牺牲仍有 live session 的 runner。
+        idle = [
+            lease for lease in self._in_use_oldest_first()
+            if not self.store.has_live_session(lease.id)
+        ]
+        return idle[0] if idle else None
 
     # ------------------------------------------------------------------ janitor
 
@@ -396,6 +456,10 @@ class Scheduler:
     def snapshot(self) -> dict:
         t = now()
         by_state = {st.value: self.store.count(st) for st in State}
+        client_by_state = {
+            state.value: sum(1 for session in self.store.sessions() if session.state is state)
+            for state in ClientState
+        }
         return {
             "paused": self.paused,
             "cold_start_remaining": max(0.0, round(self._cold_start_until - t, 1)),
@@ -405,6 +469,7 @@ class Scheduler:
             "max_inflight": self.s.max_inflight,
             "inflight": self.store.count_inflight(),
             "by_state": by_state,
+            "client_by_state": client_by_state,
             "active_ports": self.store.active_ports(),
             "ports": self.store.ports.stats(),
             "gh_rate_remaining": self.gh.rate_remaining,

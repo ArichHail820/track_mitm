@@ -81,10 +81,29 @@ class GitHubClient:
         if resp.status_code not in (201, 204):
             raise GitHubError(resp.status_code, resp.text[:300])
 
-    # ---------- 强杀 ----------
+    # ---------- 查找 / 强杀 ----------
+
+    async def find_run_id(self, lease_id: str) -> str | None:
+        """workflow_dispatch 不返回 run_id，借助 run-name 中的 lease_id 反查。"""
+        path = f"/repos/{self._repo}/actions/workflows/{self.s.gh_workflow}/runs"
+        try:
+            resp = await self._req(
+                "GET", path, params={"event": "workflow_dispatch", "per_page": 100}
+            )
+        except httpx.HTTPError as exc:
+            log.warning("按 lease %s 查找 run 失败: %s", lease_id[:8], exc)
+            return None
+        if resp.status_code != 200:
+            log.warning("按 lease %s 查找 run 失败: HTTP %s", lease_id[:8], resp.status_code)
+            return None
+        expected = f"exit-node-{lease_id}"
+        for run in resp.json().get("workflow_runs", []):
+            if run.get("display_title") == expected:
+                return str(run["id"])
+        return None
 
     async def cancel_run(self, run_id: str) -> bool:
-        """取消一个 run。用于失联 / 待回收超时的僵尸 job,避免白占并发名额和分钟数。"""
+        """请求取消 run；返回只表示 GitHub 已接受，完成状态需另行确认。"""
         path = f"/repos/{self._repo}/actions/runs/{run_id}/cancel"
         try:
             resp = await self._req("POST", path)
@@ -96,6 +115,21 @@ class GitHubClient:
             return True
         log.warning("cancel run %s 失败: %s %s", run_id, resp.status_code, resp.text[:200])
         return False
+
+    async def run_completed(self, run_id: str) -> bool | None:
+        """True=已完成，False=仍运行，None=暂时无法确认。"""
+        try:
+            resp = await self._req("GET", f"/repos/{self._repo}/actions/runs/{run_id}")
+        except httpx.HTTPError as exc:
+            log.warning("查询 run %s 状态失败: %s", run_id, exc)
+            return None
+        if resp.status_code == 404:
+            log.warning("查询 run %s 得到 404，保持隔离而不是假定已完成", run_id)
+            return None
+        if resp.status_code != 200:
+            log.warning("查询 run %s 状态失败: HTTP %s", run_id, resp.status_code)
+            return None
+        return resp.json().get("status") == "completed"
 
     # ---------- 清理 ----------
 

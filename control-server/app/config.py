@@ -56,6 +56,7 @@ class Settings:
     # ---------- 鉴权 ----------
     node_token: str          # 节点侧 Bearer 共享密钥
     admin_token: str         # 运维接口密钥
+    client_token: str        # 本地客户端 acquire/release 共享密钥
     oidc_enabled: bool       # 是否额外校验 GitHub OIDC(第二因子)
     oidc_audience: str
     oidc_repository: str     # 期望的 repository claim,形如 owner/repo
@@ -64,6 +65,14 @@ class Settings:
     base_port: int
     pool_size: int
     port_cooldown: float     # 端口归还前的冷却,避免跨代连接串台
+
+    # ---------- 客户端独占会话 / HY2 ----------
+    public_host: str
+    client_ttl_default: int
+    client_ttl_max: int
+    client_release_grace: float
+    hy2_helper: str
+    hy2_command_timeout: float
 
     # ---------- 容量 ----------
     n_target: int            # 目标在线(使用中)节点数
@@ -153,6 +162,21 @@ class Settings:
             )
         if self.oidc_enabled and not self.oidc_repository:
             errs.append("OIDC_ENABLED=1 时必须设置 OIDC_REPOSITORY=owner/repo")
+        if not self.public_host:
+            errs.append("PUBLIC_HOST 不能为空")
+        if not (30 <= self.client_ttl_default <= self.client_ttl_max):
+            errs.append(
+                f"必须满足 30 <= CLIENT_TTL_DEFAULT({self.client_ttl_default}) "
+                f"<= CLIENT_TTL_MAX({self.client_ttl_max})"
+            )
+        # acquire 只会选择剩余硬寿命足够的 runner；这里先保证单次会话理论上能装下。
+        if self.client_ttl_max + self.drain_timeout + 30 > self.hard_lifetime:
+            errs.append(
+                f"CLIENT_TTL_MAX({self.client_ttl_max}) + DRAIN_TIMEOUT({self.drain_timeout}) "
+                f"+ 30s 安全余量不能超过 HARD_LIFETIME({self.hard_lifetime})"
+            )
+        if self.client_release_grace < 0:
+            errs.append("CLIENT_RELEASE_GRACE 不能为负数")
 
         if errs:
             raise RuntimeError("配置校验失败:\n  - " + "\n  - ".join(errs))
@@ -210,6 +234,7 @@ def load_settings() -> Settings:
 
         node_token=_s("NODE_TOKEN", required=True),
         admin_token=_s("ADMIN_TOKEN", required=True),
+        client_token=_s("CLIENT_TOKEN", required=True),
         oidc_enabled=_b("OIDC_ENABLED", False),
         oidc_audience=_s("OIDC_AUDIENCE", "exit-node-pool"),
         oidc_repository=_s("OIDC_REPOSITORY", ""),
@@ -217,6 +242,13 @@ def load_settings() -> Settings:
         base_port=base_port,
         pool_size=pool_size,
         port_cooldown=_f("PORT_COOLDOWN", 10.0),
+
+        public_host=_s("PUBLIC_HOST", required=True),
+        client_ttl_default=_i("CLIENT_TTL_DEFAULT", 600),
+        client_ttl_max=_i("CLIENT_TTL_MAX", 1200),
+        client_release_grace=_f("CLIENT_RELEASE_GRACE", 10.0),
+        hy2_helper=_s("HY2_HELPER", "/usr/local/libexec/exit-node-hy2-control.py"),
+        hy2_command_timeout=_f("HY2_COMMAND_TIMEOUT", 15.0),
 
         n_target=_i("N_TARGET", 16),
         n_min=_i("N_MIN", 12),

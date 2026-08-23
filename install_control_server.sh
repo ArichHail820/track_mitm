@@ -55,6 +55,11 @@ fi
 
 NODE_TOKEN="${NODE_TOKEN:-$(openssl rand -hex 32)}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-$(openssl rand -hex 32)}"
+EXISTING_CLIENT_TOKEN=""
+if [ -r "$ENV_FILE" ]; then
+  EXISTING_CLIENT_TOKEN="$(sed -n 's/^CLIENT_TOKEN=//p' "$ENV_FILE" | head -n 1)"
+fi
+CLIENT_TOKEN="${CLIENT_TOKEN:-${EXISTING_CLIENT_TOKEN:-$(openssl rand -hex 32)}}"
 
 # 容量参数可在命令行覆盖。建议首次部署用 N_TARGET=2 跑通全链路,确认出口 IP 真的能用之后
 # 再调到 16 —— 一上来就开 16 个 runner,出问题时日志会被 16 份心跳刷得很难看。
@@ -110,8 +115,15 @@ echo "    workflow ${GH_WORKFLOW_FILE} 已登记,state=${WF_STATE}"
 
 # ---------------------------------------------------------------- 依赖
 echo "==> 安装系统依赖"
-apt-get install -y -qq python3 python3-venv python3-pip gnupg \
+apt-get install -y -qq python3 python3-venv python3-pip gnupg sudo \
   debian-keyring debian-archive-keyring apt-transport-https >/dev/null
+
+HYSTERIA_BIN="$(command -v hysteria || true)"
+[ -n "$HYSTERIA_BIN" ] || die "未安装 hysteria，先完成数据面安装"
+HYSTERIA_BIN="$(readlink -f "$HYSTERIA_BIN")"
+[ -x "$HYSTERIA_BIN" ] || die "hysteria 路径不可执行: $HYSTERIA_BIN"
+[ -r /etc/hysteria/server.crt ] || die "缺少 /etc/hysteria/server.crt"
+[ -r /etc/hysteria/server.key ] || die "缺少 /etc/hysteria/server.key"
 
 if ! command -v caddy >/dev/null 2>&1; then
   echo "==> 安装 Caddy(HTTPS 反代 + 自动证书)"
@@ -129,6 +141,7 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/control-server"
 [ -d "${SRC_DIR}/app" ] || die "找不到 ${SRC_DIR}/app,请在仓库根目录运行本脚本"
 
 mkdir -p "${APP_DIR}" "${DATA_DIR}"
+rm -rf "${APP_DIR}/app"
 cp -r "${SRC_DIR}/app" "${SRC_DIR}/requirements.txt" "${APP_DIR}/"
 
 if [ ! -x "${APP_DIR}/venv/bin/python" ]; then
@@ -138,7 +151,61 @@ fi
 "${APP_DIR}/venv/bin/pip" install -q -r "${APP_DIR}/requirements.txt"
 
 id -u exitctl >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin exitctl
+id -u hysteria >/dev/null 2>&1 || die "数据面缺少 hysteria 系统用户"
 chown -R exitctl:exitctl "${APP_DIR}" "${DATA_DIR}"
+chgrp hysteria /etc/hysteria/server.crt /etc/hysteria/server.key
+chmod 640 /etc/hysteria/server.crt /etc/hysteria/server.key
+
+# ---------------------------------------------------------------- 独占 HY2 helper + systemd 模板
+# 控制服务保持非 root；仅允许通过无参数、stdin JSON 的 helper 管理池内端口。
+echo "==> 配置独占 Hysteria2 实例管理"
+install -D -o root -g root -m 0750 "${SRC_DIR}/hy2_helper.py" \
+  /usr/local/libexec/exit-node-hy2-control.py
+mkdir -p /var/lib/exit-node-hy2
+chown root:hysteria /var/lib/exit-node-hy2
+chmod 750 /var/lib/exit-node-hy2
+cat > /etc/exit-node-hy2.json <<EOF
+{
+  "base_port": ${BASE_PORT},
+  "pool_size": ${POOL_SIZE},
+  "cert": "/etc/hysteria/server.crt",
+  "key": "/etc/hysteria/server.key",
+  "data_dir": "/var/lib/exit-node-hy2",
+  "service_group": "hysteria"
+}
+EOF
+chown root:root /etc/exit-node-hy2.json
+chmod 600 /etc/exit-node-hy2.json
+
+cat > /etc/systemd/system/hysteria-session@.service <<EOF
+[Unit]
+Description=Hysteria2 exclusive client session on UDP %i
+After=network-online.target gost-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hysteria
+Group=hysteria
+ExecStart=${HYSTERIA_BIN} server --config /var/lib/exit-node-hy2/%i.yaml --disable-update-check
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/exit-node-hy2 /etc/hysteria
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/sudoers.d/exit-node-hy2-control <<'EOF'
+exitctl ALL=(root) NOPASSWD: /usr/local/libexec/exit-node-hy2-control.py
+EOF
+chmod 440 /etc/sudoers.d/exit-node-hy2-control
+visudo -cf /etc/sudoers.d/exit-node-hy2-control >/dev/null \
+  || die "HY2 helper sudoers 校验失败"
 
 # ---------------------------------------------------------------- 环境变量
 echo "==> 写入 ${ENV_FILE}"
@@ -154,6 +221,7 @@ GH_REF=${GH_REF}
 # NODE_TOKEN 要同步配到仓库 Secrets 的 NODE_TOKEN
 NODE_TOKEN=${NODE_TOKEN}
 ADMIN_TOKEN=${ADMIN_TOKEN}
+CLIENT_TOKEN=${CLIENT_TOKEN}
 # 打开 OIDC 第二因子(workflow 侧无需改动):
 # OIDC_ENABLED=1
 # OIDC_REPOSITORY=${GH_OWNER}/${GH_REPO}
@@ -164,6 +232,14 @@ OIDC_AUDIENCE=exit-node-pool
 BASE_PORT=${BASE_PORT}
 POOL_SIZE=${POOL_SIZE}
 PORT_COOLDOWN=10
+
+# ============ 客户端独占会话 / HY2 ============
+PUBLIC_HOST=${DOMAIN}
+CLIENT_TTL_DEFAULT=600
+CLIENT_TTL_MAX=1200
+CLIENT_RELEASE_GRACE=10
+HY2_HELPER=/usr/local/libexec/exit-node-hy2-control.py
+HY2_COMMAND_TIMEOUT=15
 
 # ============ 容量 ============
 # 由 Little's law 反推:稳态在途 = N_TARGET * T_warmup / SOFT_LIFETIME
@@ -251,7 +327,8 @@ caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile \
   || die "Caddyfile 校验失败,请检查 /etc/caddy/sites/${SERVICE}.caddy"
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE}"
+systemctl enable "${SERVICE}"
+systemctl restart "${SERVICE}"
 systemctl reload caddy 2>/dev/null || systemctl restart caddy
 
 sleep 3
@@ -281,6 +358,8 @@ cat <<EOF
   curl -s https://${DOMAIN}/healthz | jq               # 健康检查(无需鉴权)
   systemctl restart ${SERVICE}                         # 重启(有 20s 冷启动收敛窗口,在线节点不会被误杀)
 
-ADMIN_TOKEN 已写入 ${ENV_FILE},请自行留存。
+ADMIN_TOKEN 和 CLIENT_TOKEN 已写入 ${ENV_FILE}(权限 600),不会在终端回显。
+客户端独占入口: ${DOMAIN}:$((BASE_PORT + 1))-$((BASE_PORT + POOL_SIZE))/UDP
+请在云安全组放行上述 UDP 范围；每次 acquire 只启动被分配端口的 HY2 实例。
 ======================================================================
 EOF

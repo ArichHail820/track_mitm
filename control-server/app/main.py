@@ -18,11 +18,13 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Respons
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .auth import Authenticator, admin_auth_dep, node_auth_dep
+from .auth import Authenticator, admin_auth_dep, client_auth_dep, node_auth_dep
 from .config import Settings, load_settings
 from .ghclient import GitHubClient
-from .models import Lease, State, now
+from .hy2 import Hy2Controller
+from .models import ClientState, Lease, State, now
 from .scheduler import Scheduler
+from .sessions import NoAvailableNode, SessionManager, SessionUnavailable
 from .store import Store
 
 log = logging.getLogger("api")
@@ -54,6 +56,15 @@ class ByeIn(BaseModel):
     reason: str = Field(default="node_exit", max_length=64)
 
 
+class AcquireIn(BaseModel):
+    request_id: str = Field(min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    ttl_seconds: int | None = Field(default=None, ge=30)
+
+
+class ReleaseIn(BaseModel):
+    session_id: str = Field(min_length=16, max_length=64)
+
+
 class TargetIn(BaseModel):
     n_target: int | None = None
 
@@ -75,6 +86,10 @@ def _recycle(reason: str, http: int = 200) -> JSONResponse:
 def _ctx(request: Request) -> tuple[Settings, Store, Scheduler]:
     st = request.app.state
     return st.settings, st.store, st.scheduler
+
+
+def _sessions(request: Request) -> SessionManager:
+    return request.app.state.sessions
 
 
 # --------------------------------------------------------------------- 节点路由
@@ -121,7 +136,7 @@ async def register(body: RegisterIn, request: Request) -> Any:
         port = store.ports.acquire()
         if port is None:
             # 端口池被冷却占满。判死并归还名额,让 reconcile 稍后重新派单。
-            sched.kill(lease, "no_free_port")
+            sched.kill(lease, "no_free_port", cancel_run=True)
             raise HTTPException(status.HTTP_409_CONFLICT, "no_free_port")
 
         lease.port = port
@@ -263,10 +278,68 @@ async def bye(body: ByeIn, request: Request) -> Response:
     async with store.lock:
         lease = store.get(body.lease_id)
         if lease is not None:
-            # 这个接口很便宜但收益很大:名额归还从"等 DRAIN_TIMEOUT 超时"变成约 0 秒,
-            # 直接给容量账本省出一个名额的余量。
-            sched.kill(lease, f"bye:{body.reason}")
+            # runner 已停 gost，但 GitHub job 尚未必 completed；进入确认队列后再归还名额。
+            sched.kill(lease, f"bye:{body.reason}", cancel_run=True)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------- 客户端独占会话路由
+
+client_router = APIRouter(prefix="/v1/client", dependencies=[Depends(client_auth_dep)])
+
+
+@client_router.post("/acquire", status_code=status.HTTP_201_CREATED)
+async def client_acquire(body: AcquireIn, request: Request) -> Any:
+    settings, _, _ = _ctx(request)
+    ttl = body.ttl_seconds or settings.client_ttl_default
+    if ttl > settings.client_ttl_max:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"ttl_seconds 不能超过 {settings.client_ttl_max}",
+        )
+    try:
+        session, credentials, runner_ip = await _sessions(request).acquire(
+            body.request_id, ttl
+        )
+    except NoAvailableNode as exc:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+            content={"detail": "no_available_node", "message": str(exc)},
+        )
+    except SessionUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return {
+        "session_id": session.id,
+        "state": session.state.value,
+        "hy2_host": settings.public_host,
+        "hy2_port": session.port,
+        "password": credentials.password,
+        "obfs_password": credentials.obfs_password,
+        "sni": settings.public_host,
+        "runner_ip": runner_ip,
+        "expires_at": session.expires_at,
+        "ttl_seconds": round(session.expires_at - session.created_at),
+    }
+
+
+@client_router.get("/sessions/{session_id}")
+async def client_session_state(session_id: str, request: Request) -> Any:
+    _, store, _ = _ctx(request)
+    async with store.lock:
+        session = store.get_session(session_id)
+        if session is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "session_unknown")
+        return session.snapshot()
+
+
+@client_router.post("/release", status_code=status.HTTP_202_ACCEPTED)
+async def client_release(body: ReleaseIn, request: Request) -> Any:
+    try:
+        session = await _sessions(request).release(body.session_id)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session_unknown") from exc
+    return session.snapshot()
 
 
 # --------------------------------------------------------------------- 运维路由
@@ -289,6 +362,11 @@ async def state(request: Request) -> Any:
                 key=lambda x: x.dead_at or 0, reverse=True,
             )[:20]
         ]
+        snap["client_sessions"] = [
+            session.snapshot()
+            for session in sorted(store.sessions(), key=lambda item: item.created_at)
+            if session.state not in (ClientState.RELEASED, ClientState.FAILED)
+        ]
         return snap
 
 
@@ -297,7 +375,17 @@ async def ports(request: Request) -> Any:
     """当前真正在服务的端口。可以喂给外部工具做 mihomo 配置校对。"""
     _, store, _ = _ctx(request)
     async with store.lock:
-        return {"in_use": store.active_ports(), "pool": store.ports.stats()}
+        return {
+            "in_use": store.active_ports(),
+            "pool": store.ports.stats(),
+            "allocated": [
+                session.snapshot()
+                for session in store.sessions()
+                if session.state in (
+                    ClientState.STARTING, ClientState.ACTIVE, ClientState.RELEASING
+                )
+            ],
+        }
 
 
 @admin_router.post("/pause")
@@ -369,14 +457,17 @@ def create_app() -> FastAPI:
         gh = GitHubClient(settings)
         sched = Scheduler(settings, store, gh)
         sched.begin_cold_start(adopted)
+        sessions = SessionManager(settings, store, sched, Hy2Controller(settings))
 
         app.state.settings = settings
         app.state.store = store
         app.state.gh = gh
         app.state.scheduler = sched
+        app.state.sessions = sessions
         app.state.auth = Authenticator(settings)
 
         await sched.start()
+        await sessions.start()
         for w in settings.warnings():
             log.warning("配置提醒:%s", w)
         log.info(
@@ -389,6 +480,7 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            await sessions.stop()
             await sched.stop()
             await gh.aclose()
             store.close()
@@ -403,6 +495,7 @@ def create_app() -> FastAPI:
         openapi_url=None,
     )
     app.include_router(node_router)
+    app.include_router(client_router)
     app.include_router(admin_router)
 
     @app.get("/healthz")
@@ -412,13 +505,19 @@ def create_app() -> FastAPI:
             sched.last_tick_at > 0
             and now() - sched.last_tick_at > settings.reconcile_tick * 10
         )
-        body = {
-            "ok": not stale,
-            "in_use": store.count(State.IN_USE),
-            "inflight": store.count_inflight(),
-            "paused": sched.paused,
-            "last_tick_age": round(now() - sched.last_tick_at, 1) if sched.last_tick_at else None,
-        }
+        async with store.lock:
+            body = {
+                "ok": not stale,
+                "in_use": store.count(State.IN_USE),
+                "available": len(store.available_leases(settings.client_ttl_default)),
+                "client_active": sum(
+                    1 for session in store.sessions()
+                    if session.state is ClientState.ACTIVE
+                ),
+                "inflight": store.count_inflight(),
+                "paused": sched.paused,
+                "last_tick_age": round(now() - sched.last_tick_at, 1) if sched.last_tick_at else None,
+            }
         return JSONResponse(status_code=200 if not stale else 503, content=body)
 
     return app

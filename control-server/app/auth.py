@@ -136,6 +136,16 @@ class Authenticator:
             options={"require": ["exp", "iat", "aud", "iss"]},
         )
 
+    # ---------- 客户端独占会话接口 ----------
+
+    def require_client(self, request: Request, authorization: str | None) -> None:
+        client_ip = request.client.host if request.client else "unknown"
+        if not self.limiter.check(f"client:{client_ip}"):
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "请求过于频繁")
+        token = _bearer(authorization)
+        if not token or not hmac.compare_digest(token, self.s.client_token):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "客户端凭证无效")
+
     # ---------- 运维接口 ----------
 
     def require_admin(self, authorization: str | None) -> None:
@@ -149,6 +159,12 @@ async def node_auth_dep(
     request: Request, authorization: str | None = Header(default=None)
 ) -> None:
     await request.app.state.auth.require_node(request, authorization)
+
+
+def client_auth_dep(
+    request: Request, authorization: str | None = Header(default=None)
+) -> None:
+    request.app.state.auth.require_client(request, authorization)
 
 
 def admin_auth_dep(request: Request, authorization: str | None = Header(default=None)) -> None:

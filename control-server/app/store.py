@@ -16,7 +16,15 @@ import sqlite3
 from typing import Iterable, Iterator
 
 from .config import Settings
-from .models import INFLIGHT_STATES, Lease, State, now
+from .models import (
+    CLIENT_LIVE_STATES,
+    INFLIGHT_STATES,
+    ClientSession,
+    ClientState,
+    Lease,
+    State,
+    now,
+)
 
 log = logging.getLogger("store")
 
@@ -38,11 +46,38 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(state);
 CREATE INDEX IF NOT EXISTS idx_leases_dead_at ON leases(dead_at);
+
+CREATE TABLE IF NOT EXISTS client_sessions (
+    id             TEXT PRIMARY KEY,
+    request_id     TEXT    NOT NULL,
+    lease_id       TEXT    NOT NULL,
+    port           INTEGER NOT NULL,
+    state          TEXT    NOT NULL,
+    created_at     REAL    NOT NULL,
+    expires_at     REAL    NOT NULL,
+    release_at     REAL,
+    released_at    REAL,
+    hy2_stopped_at REAL,
+    reason         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_client_sessions_state
+    ON client_sessions(state);
+CREATE INDEX IF NOT EXISTS idx_client_sessions_lease
+    ON client_sessions(lease_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_client_sessions_request
+    ON client_sessions(request_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_client_sessions_live_lease
+    ON client_sessions(lease_id)
+    WHERE state IN ('starting', 'active', 'releasing');
 """
 
 _COLS = (
     "id", "state", "run_id", "runner_ip", "port", "created_at", "registered_at",
     "in_use_since", "last_hb", "drain_at", "dead_at", "reason", "register_count",
+)
+_SESSION_COLS = (
+    "id", "request_id", "lease_id", "port", "state", "created_at", "expires_at",
+    "release_at", "released_at", "hy2_stopped_at", "reason",
 )
 
 
@@ -55,12 +90,13 @@ class PortPool:
         self._free: set[int] = set()
         self._held: set[int] = set()
         self._cooling: dict[int, float] = {}
+        self._quarantined: set[int] = set()
 
     def rebuild(self, held: Iterable[int]) -> None:
         """按当前活跃租约重建占用情况(冷启动 / 一致性修复用)。"""
         self._held = {p for p in held if p in self._all}
         self._cooling = {}
-        self._free = self._all - self._held
+        self._free = self._all - self._held - self._quarantined
 
     def acquire(self) -> int | None:
         self._tick()
@@ -76,14 +112,37 @@ class PortPool:
         if port is None or port not in self._all:
             return
         self._held.discard(port)
+        if port in self._quarantined:
+            # HY2 未确认停止时绝不能复用同号端口，否则旧凭据会跨代接入新 runner。
+            self._cooling.pop(port, None)
+            self._free.discard(port)
+            return
         self._cooling[port] = now() + self._cooldown_secs
+
+    def quarantine(self, port: int | None) -> None:
+        if port is None or port not in self._all:
+            return
+        self._quarantined.add(port)
+        self._cooling.pop(port, None)
+        self._free.discard(port)
+
+    def mark_hy2_stopped(self, port: int, *, lease_still_holds: bool) -> None:
+        if port not in self._all:
+            return
+        self._quarantined.discard(port)
+        if lease_still_holds:
+            self._held.add(port)
+            self._free.discard(port)
+        else:
+            self._held.discard(port)
+            self._cooling[port] = now() + self._cooldown_secs
 
     def _tick(self) -> None:
         t = now()
         done = [p for p, ready in self._cooling.items() if ready <= t]
         for p in done:
             del self._cooling[p]
-            if p not in self._held:
+            if p not in self._held and p not in self._quarantined:
                 self._free.add(p)
 
     def stats(self) -> dict:
@@ -92,6 +151,7 @@ class PortPool:
             "total": len(self._all),
             "held": len(self._held),
             "cooling": len(self._cooling),
+            "quarantined": len(self._quarantined),
             "free": len(self._free),
         }
 
@@ -114,6 +174,7 @@ class Store:
         self.lock = asyncio.Lock()
         self.ports = PortPool(settings)
         self._leases: dict[str, Lease] = {}
+        self._sessions: dict[str, ClientSession] = {}
         self._db: sqlite3.Connection | None = None
 
     # ---------- 生命周期 ----------
@@ -131,7 +192,9 @@ class Store:
         db.execute("PRAGMA synchronous=NORMAL")
         db.executescript(_SCHEMA)
         self._db = db
-        return self._load()
+        adopted = self._load()
+        self._load_sessions()
+        return adopted
 
     def close(self) -> None:
         if self._db is not None:
@@ -174,6 +237,31 @@ class Store:
         )
         return adopted
 
+    def _load_sessions(self) -> None:
+        assert self._db is not None
+        rows = self._db.execute(
+            "SELECT * FROM client_sessions ORDER BY created_at DESC LIMIT 1000"
+        ).fetchall()
+        for r in rows:
+            session = ClientSession(
+                id=r["id"],
+                request_id=r["request_id"],
+                lease_id=r["lease_id"],
+                port=r["port"],
+                state=ClientState(r["state"]),
+                created_at=r["created_at"],
+                expires_at=r["expires_at"],
+                release_at=r["release_at"],
+                released_at=r["released_at"],
+                hy2_stopped_at=r["hy2_stopped_at"],
+                reason=r["reason"],
+            )
+            # STARTING 凭据可由 session_id 确定性恢复；保持状态让相同 request_id 重试。
+            self._sessions[session.id] = session
+            if session.hy2_stopped_at is None:
+                self.ports.quarantine(session.port)
+            self.persist_session(session)
+
     # ---------- 持久化 ----------
 
     def persist(self, lease: Lease) -> None:
@@ -196,6 +284,31 @@ class Store:
             # 持久化失败不能拖垮控制面:内存状态仍然正确,最坏是重启后少认领几条
             log.exception("持久化 lease %s 失败", lease.id)
 
+    def persist_session(self, session: ClientSession) -> None:
+        """会话分配必须持久化成功，否则不能向客户端宣告占用成功。"""
+        if self._db is None:
+            return
+        vals = (
+            session.id, session.request_id, session.lease_id, session.port,
+            session.state.value,
+            session.created_at, session.expires_at, session.release_at,
+            session.released_at, session.hy2_stopped_at, session.reason,
+        )
+        placeholders = ",".join("?" * len(_SESSION_COLS))
+        try:
+            self._db.execute(
+                f"INSERT INTO client_sessions ({','.join(_SESSION_COLS)}) "
+                f"VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET "
+                + ",".join(
+                    f"{column}=excluded.{column}"
+                    for column in _SESSION_COLS if column != "id"
+                ),
+                vals,
+            )
+        except sqlite3.Error:
+            log.exception("持久化客户端会话 %s 失败", session.id)
+            raise
+
     def purge_db(self, keep: int = 500) -> None:
         if self._db is None:
             return
@@ -204,6 +317,15 @@ class Store:
                 "DELETE FROM leases WHERE state = ? AND id NOT IN "
                 "(SELECT id FROM leases WHERE state = ? ORDER BY dead_at DESC LIMIT ?)",
                 (State.DEAD.value, State.DEAD.value, keep),
+            )
+            self._db.execute(
+                "DELETE FROM client_sessions WHERE state IN (?, ?) AND id NOT IN "
+                "(SELECT id FROM client_sessions WHERE state IN (?, ?) "
+                "ORDER BY released_at DESC LIMIT ?)",
+                (
+                    ClientState.RELEASED.value, ClientState.FAILED.value,
+                    ClientState.RELEASED.value, ClientState.FAILED.value, keep,
+                ),
             )
         except sqlite3.Error:
             log.exception("清理历史 lease 失败")
@@ -246,6 +368,45 @@ class Store:
         return sorted(l.port for l in self._leases.values()
                       if l.port is not None and l.state is State.IN_USE)
 
+    def get_session(self, session_id: str) -> ClientSession | None:
+        return self._sessions.get(session_id)
+
+    def get_session_by_request(self, request_id: str) -> ClientSession | None:
+        return next(
+            (session for session in self._sessions.values() if session.request_id == request_id),
+            None,
+        )
+
+    def sessions(self) -> list[ClientSession]:
+        return list(self._sessions.values())
+
+    def live_session_for_lease(self, lease_id: str) -> ClientSession | None:
+        return next(
+            (
+                session for session in self._sessions.values()
+                if session.lease_id == lease_id and session.state in CLIENT_LIVE_STATES
+            ),
+            None,
+        )
+
+    def has_live_session(self, lease_id: str) -> bool:
+        return self.live_session_for_lease(lease_id) is not None
+
+    def available_leases(self, ttl: float) -> list[Lease]:
+        """返回能完整覆盖请求 TTL 和回收余量的空闲 runner。"""
+        required_remaining = ttl + self.settings.drain_timeout + 30.0
+        return sorted(
+            (
+                lease for lease in self._leases.values()
+                if lease.state is State.IN_USE
+                and not lease.unconfirmed
+                and lease.port is not None
+                and not self.has_live_session(lease.id)
+                and self.settings.hard_lifetime - lease.in_use_age() >= required_remaining
+            ),
+            key=lambda lease: lease.in_use_since or lease.created_at,
+        )
+
     # ---------- 变更 ----------
 
     def create(self) -> Lease:
@@ -253,6 +414,40 @@ class Store:
         self._leases[lease.id] = lease
         self.persist(lease)
         return lease
+
+    def create_session(self, lease: Lease, ttl: float, request_id: str) -> ClientSession:
+        if lease.port is None or self.has_live_session(lease.id):
+            raise RuntimeError("runner 已被占用或没有端口")
+        if self.get_session_by_request(request_id) is not None:
+            raise RuntimeError("request_id 已存在")
+        session = ClientSession(
+            request_id=request_id,
+            lease_id=lease.id,
+            port=lease.port,
+            expires_at=now() + ttl,
+        )
+        self._sessions[session.id] = session
+        self.ports.quarantine(session.port)
+        try:
+            self.persist_session(session)
+        except Exception:
+            self._sessions.pop(session.id, None)
+            self.ports.mark_hy2_stopped(session.port, lease_still_holds=True)
+            raise
+        return session
+
+    def request_session_release(self, session: ClientSession, reason: str) -> None:
+        if session.state not in CLIENT_LIVE_STATES:
+            return
+        session.state = ClientState.RELEASING
+        session.release_at = session.release_at or now()
+        session.reason = reason
+        self.persist_session(session)
+
+    def request_release_for_lease(self, lease_id: str, reason: str) -> None:
+        session = self.live_session_for_lease(lease_id)
+        if session is not None:
+            self.request_session_release(session, reason)
 
     def prune_memory(self) -> int:
         """把过了保留期的 DEAD 租约从内存里丢掉,防止长跑进程无限膨胀。"""
@@ -264,4 +459,12 @@ class Store:
         ]
         for lid in gone:
             del self._leases[lid]
-        return len(gone)
+        session_gone = [
+            sid for sid, session in self._sessions.items()
+            if session.state in (ClientState.RELEASED, ClientState.FAILED)
+            and session.released_at is not None
+            and t - session.released_at > cutoff
+        ]
+        for sid in session_gone:
+            del self._sessions[sid]
+        return len(gone) + len(session_gone)
